@@ -1,3 +1,5 @@
+﻿// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2025 Erisme-Bishony
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf, process::Command, str};
@@ -42,13 +44,13 @@ async fn main() -> anyhow::Result<()> {
     fmt().with_env_filter(EnvFilter::from_default_env()).init();
     let args = Cli::parse();
 
-    // 禁用系统代理，避免本地 127.0.0.1 走公司代理导致 502
+    // 绂佺敤绯荤粺浠ｇ悊锛岄伩鍏嶆湰鍦?127.0.0.1 璧板叕鍙镐唬鐞嗗鑷?502
     let client = reqwest::Client::builder().no_proxy().build()?;
 
     tracing::info!("agent starting, server={}, runner_id={}", args.server, args.runner_id);
 
     loop {
-        // 1) 租约
+        // 1) 绉熺害
         let lease_url = format!("{}/lease", args.server);
         let resp = client.post(&lease_url)
             .json(&LeaseRequest { runner_id: args.runner_id.clone(), token: Some(args.token.clone()) })
@@ -70,11 +72,11 @@ async fn main() -> anyhow::Result<()> {
             lease.job_id, lease.repo.owner, lease.repo.name, lease.target_key, lease.commit_sha
         );
 
-        // 2) 生成 & 执行重放脚本
+        // 2) 鐢熸垚 & 鎵ц閲嶆斁鑴氭湰
         let script_path = write_replay_script(&lease)?;
         let run = run_replay_script(&script_path)?;
 
-        // 3) 解析脚本打印的“产物路径”，做校验
+        // 3) 瑙ｆ瀽鑴氭湰鎵撳嵃鐨勨€滀骇鐗╄矾寰勨€濓紝鍋氭牎楠?
         let (status, note) = match run {
             ExecResult { code: 0, stdout, stderr } => {
                 let artifact = parse_artifact_from_stdout(&stdout);
@@ -102,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        // 4) 回报
+        // 4) 鍥炴姤
         let report_url = format!("{}/report", args.server);
         let ok = client.post(&report_url)
             .json(&ReportRequest { job_id: lease.job_id, status, note })
@@ -116,7 +118,7 @@ fn write_replay_script(lease: &LeaseResponse) -> anyhow::Result<PathBuf> {
     work.push(format!("ffi_work_{}", lease.job_id));
     fs::create_dir_all(&work)?;
 
-    // 失败测试：设置 MONY_FAIL=1 会让脚本返回非零
+    // 澶辫触娴嬭瘯锛氳缃?MONY_FAIL=1 浼氳鑴氭湰杩斿洖闈為浂
     let induce_fail = std::env::var("MONY_FAIL").ok().as_deref() == Some("1");
 
     #[cfg(windows)]
@@ -131,12 +133,12 @@ fn write_replay_script(lease: &LeaseResponse) -> anyhow::Result<PathBuf> {
         writeln!(content, r#"$env:COMMIT_SHA = "{}""#, lease.commit_sha)?;
         writeln!(content, r#"$work = "{}""#, work.display())?;
         writeln!(content, r#"New-Item -ItemType Directory -Force $work | Out-Null"#)?;
-        // TODO: 真正接入 git clone / maturin build / audit / sbom
+        // TODO: 鐪熸鎺ュ叆 git clone / maturin build / audit / sbom
         if induce_fail {
             writeln!(content, r#"Write-Error "forced failure via MONY_FAIL"; exit 1"#)?;
         } else {
             writeln!(content, r#""build ok: $env:TARGET_KEY $env:COMMIT_SHA" | Out-File -Encoding utf8 "$work\artifact.txt""#)?;
-            // 将产物绝对路径打印到 stdout 的最后一行（Agent 用于解析）
+            // 灏嗕骇鐗╃粷瀵硅矾寰勬墦鍗板埌 stdout 鐨勬渶鍚庝竴琛岋紙Agent 鐢ㄤ簬瑙ｆ瀽锛?
             writeln!(content, r#"Write-Host "$work\artifact.txt""#)?;
         }
         fs::write(&p, content)?;
@@ -208,3 +210,4 @@ fn trim(s: &str) -> String {
     let s = s.trim();
     if s.len() > 500 { format!("{}...[trunc]", &s[..500]) } else { s.to_string() }
 }
+
