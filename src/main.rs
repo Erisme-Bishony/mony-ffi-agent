@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2025 Erisme-Bishony
 use clap::Parser;
 use serde::{Deserialize, Serialize};
