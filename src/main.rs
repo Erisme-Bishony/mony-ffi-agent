@@ -124,17 +124,36 @@ fn write_replay_script(lease: &LeaseResponse) -> anyhow::Result<PathBuf> {
         let mut content = String::new();
         writeln!(content, r#"$ErrorActionPreference = 'Stop'"#)?;
         writeln!(content, r#"$ProgressPreference = 'SilentlyContinue'"#)?;
-        writeln!(content, r#"$env:TARGET_KEY = "{}""#, lease.target_key)?;
-        writeln!(content, r#"$env:COMMIT_SHA = "{}""#, lease.commit_sha)?;
         writeln!(content, r#"$work = "{}""#, work.display())?;
+        writeln!(content, r#"$src = Join-Path $work 'src'"#)?;
         writeln!(content, r#"New-Item -ItemType Directory -Force $work | Out-Null"#)?;
-        if induce_fail {
-            writeln!(content, r#"Write-Error "forced failure via MONY_FAIL"; exit 1"#)?;
-        } else {
-            writeln!(content, r#""build ok: $env:TARGET_KEY $env:COMMIT_SHA" | Out-File -Encoding utf8 "$work\artifact.txt""#)?;
-            // 将产物绝对路径打印到 stdout 的最后一行（Agent 用于解析）
-            writeln!(content, r#"Write-Host "$work\artifact.txt""#)?;
-        }
+
+        // 1) 准备源码：优先 REPLAY_SRC，否则 git clone
+        writeln!(content, r#"if ($env:REPLAY_SRC -and (Test-Path $env:REPLAY_SRC)) {{ "#)?;
+        writeln!(content, r#"  Copy-Item -Recurse -Force $env:REPLAY_SRC $src"#)?;
+        writeln!(content, r#"}} else {{ "#)?;
+        writeln!(content, r#"  $repoUrl = "https://github.com/{}/{}.git""#, lease.repo.owner, lease.repo.name)?;
+        writeln!(content, r#"  git clone --depth 1 $repoUrl $src"#)?;
+        writeln!(content, r#"  if ("{}" -ne "") {{ Push-Location $src; git fetch --depth 1 origin "{}" 2>$null; git checkout "{}"; Pop-Location }}"#, lease.commit_sha, lease.commit_sha, lease.commit_sha)?;
+        writeln!(content, r#"}}"#)?;
+
+        // 2) 安装 maturin（幂等）
+        writeln!(content, r#"py -3.11 -m pip install -U pip maturin | Out-Null"#)?;
+
+        // 3) 失败注入
+        writeln!(content, r#"if ($env:MONY_FAIL -eq "1") {{ Write-Error "forced failure via MONY_FAIL"; exit 1 }}"#)?;
+
+        // 4) 构建（针对当前平台）
+        writeln!(content, r#"Push-Location $src"#)?;
+        writeln!(content, r#"py -3.11 -m maturin build --release"#)?;
+        writeln!(content, r#"Pop-Location"#)?;
+
+        // 5) 找到 wheel 并输出绝对路径（Agent 解析）
+        writeln!(content, r#"$wheelDir = Join-Path $src 'target\wheels'"#)?;
+        writeln!(content, r#"$wheel = Get-ChildItem -Recurse -Filter *.whl $wheelDir | Sort-Object LastWriteTime -Descending | Select-Object -First 1"#)?;
+        writeln!(content, r#"if (-not $wheel) {{ Write-Error "no wheel produced"; exit 1 }}"#)?;
+        writeln!(content, r#"Write-Host $($wheel.FullName)"#)?;
+
         fs::write(&p, content)?;
         return Ok(p);
     }
@@ -148,16 +167,21 @@ fn write_replay_script(lease: &LeaseResponse) -> anyhow::Result<PathBuf> {
         let mut content = String::new();
         writeln!(content, "#!/usr/bin/env bash")?;
         writeln!(content, "set -euo pipefail")?;
-        writeln!(content, r#"export TARGET_KEY="{}""#, lease.target_key)?;
-        writeln!(content, r#"export COMMIT_SHA="{}""#, lease.commit_sha)?;
         writeln!(content, r#"work="{}""#, work.display())?;
+        writeln!(content, r#"src="$work/src""#)?;
         writeln!(content, r#"mkdir -p "$work""#)?;
-        if induce_fail {
-            writeln!(content, r#"echo "forced failure via MONY_FAIL" >&2; exit 1"#)?;
-        } else {
-            writeln!(content, r#"echo "build ok: $TARGET_KEY $COMMIT_SHA" > "$work/artifact.txt""#)?;
-            writeln!(content, r#"echo "$work/artifact.txt""#)?;
-        }
+        writeln!(content, r#"if [[ -n "${REPLAY_SRC:-}" && -d "$REPLAY_SRC" ]]; then cp -r "$REPLAY_SRC" "$src"; else "#)?;
+        writeln!(content, r#"  repo_url="https://github.com/{}/{}.git""#, lease.repo.owner, lease.repo.name)?;
+        writeln!(content, r#"  git clone --depth 1 "$repo_url" "$src""#)?;
+        writeln!(content, r#"  if [[ -n "{}" ]]; then (cd "$src" && git fetch --depth 1 origin "{}" >/dev/null 2>&1 && git checkout "{}"); fi"#, lease.commit_sha, lease.commit_sha, lease.commit_sha)?;
+        writeln!(content, r#"fi"#)?;
+        writeln!(content, r#"python -m pip install -U pip maturin >/dev/null"#)?;
+        writeln!(content, r#"if [[ "${MONY_FAIL:-}" == "1" ]]; then echo "forced failure via MONY_FAIL" >&2; exit 1; fi"#)?;
+        writeln!(content, r#"(cd "$src" && maturin build --release)"#)?;
+        writeln!(content, r#"wheel_dir="$src/target/wheels""#)?;
+        writeln!(content, r#"wheel=$(ls -1t "$wheel_dir"/*.whl | head -n1 || true)"#)?;
+        writeln!(content, r#"[[ -n "$wheel" ]] || {{ echo "no wheel produced" >&2; exit 1 }}"#)?;
+        writeln!(content, r#"echo "$wheel""#)?;
         fs::write(&p, content)?;
         let mut perm = fs::metadata(&p)?.permissions();
         perm.set_mode(0o755);
@@ -201,5 +225,16 @@ fn sha256_and_size(p: &PathBuf) -> anyhow::Result<(String, u64)> {
 
 fn trim(s: &str) -> String {
     let s = s.trim();
-    if s.len() > 500 { format!("{}...[trunc]", &s[..500]) } else { s.to_string() }
+    const MAX: usize = 500;
+    if s.chars().count() > MAX {
+        let mut out = String::with_capacity(MAX + 12);
+        for (i, ch) in s.chars().enumerate() {
+            if i >= MAX { break; }
+            out.push(ch);
+        }
+        out.push_str("...[trunc]");
+        out
+    } else {
+        s.to_string()
+    }
 }
