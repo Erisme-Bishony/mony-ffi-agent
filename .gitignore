@@ -7,3 +7,8 @@ Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# backups
+*.bak
+*.orig
+*.old
